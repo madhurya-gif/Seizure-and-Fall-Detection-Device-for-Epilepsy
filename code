@@ -1,0 +1,658 @@
+/*
+ * fallband.ino
+ * Arduino Nano 33 BLE Rev2 (BMI270)
+ *
+ * Fall    : free fall + impact -> model -> "fall"    -> amber, then red
+ * Seizure : sustained shaking  -> model -> "seizure" -> blue
+ *
+ * Seizure detection is deliberately sensitive. The shake proposer fires
+ * easily, the confidence bar is low, and strong sustained shaking
+ * alerts even if the model disagrees -- the seizure class came from
+ * only 30 recordings, so it will miss things. A false alarm costs a
+ * button press; a missed seizure costs more.
+ *
+ * Every suppressed shake prints WHY. Silence was what made this look
+ * like a dead sensor when it was really the refractory timer.
+ *
+ * LIBRARIES  Arduino_BMI270_BMM150, ArduinoBLE, fall_detect_inferencing
+ * BOARD      Arduino Mbed OS Nano Boards > Arduino Nano 33 BLE
+ *
+ * WIRING  (3.3 V logic, NOT 5 V tolerant)
+ *   Bi-colour LED module: 1+ -> D3 (red), 2+ -> D5 (green), GND -> GND
+ *   Bare blue LED: anode -> D21 via 68R, cathode -> GND
+ *   Buzzer module: TTL -> D9, GND -> GND, +5V pad -> 3.3V
+ *   Button: D2 to GND
+ *
+ * BLE alert codes: 0 clear, 1 fall, 2 seizure, 9 sensor fault
+ *
+ * NOT A MEDICAL DEVICE.
+ */
+
+#include <Arduino_BMI270_BMM150.h>
+#include <ArduinoBLE.h>
+#include <fall_detect_inferencing.h>
+
+// ---------------------------------------------------------- config
+#define SAMPLE_HZ     100
+#define POST_MS       1200
+#define CONF_FALL     0.75f
+#define CONF_SEIZURE  0.45f
+
+#define PROP_FREEFALL_G   0.95f
+#define PROP_IMPACT_G     1.70f
+#define PROP_WINDOW_MS    1000
+
+// Shake proposer. Only has to notice something rhythmic; the model
+// names it. Band goes to 25 Hz because the recorded shaking measured
+// 11 Hz median with plenty of samples above 15.
+#define SHAKE_WIN_MS      500
+#define SHAKE_RMS_G       0.10f
+#define SHAKE_FREQ_LO     1.0f
+#define SHAKE_FREQ_HI     25.0f
+#define SHAKE_DEADBAND    0.02f
+#define SHAKE_WINDOWS     2       // ~1 s
+#define SHAKE_RETRY_MS    1500UL
+
+// Threshold override: strong sustained shaking alerts regardless of
+// the model. Set to 0 to trust the model alone.
+#define SHAKE_FORCE_ON      1
+#define SHAKE_FORCE_RMS     0.30f
+#define SHAKE_FORCE_WINDOWS 4     // ~2 s
+
+#define DC_ALPHA          0.02f
+#define LP_ALPHA          0.35f
+#define SHAKE_WIN_SAMPLES (SAMPLE_HZ * SHAKE_WIN_MS / 1000)
+
+#define TILT_TILTED_DEG     30.0f
+#define TILT_HORIZONTAL_DEG 60.0f
+
+#define BUZZER_DELAY_MS   1500UL
+#define CANCEL_MS         6000UL
+#define REFRACTORY_MS     8000UL
+#define ALARM_TIMEOUT_MS 60000UL   // a missed button press must not
+                                   // disable detection forever
+#define PRINT_MS           500
+#define ALARM_LOG_MS     10000UL
+
+#define WATCHDOG_MS      4000UL
+
+// IMU health. A stationary BMI270's own noise is around 0.002 g, so the
+// old threshold declared a perfectly healthy sensor frozen whenever the
+// board sat still on a desk. A genuinely frozen sensor returns a
+// bit-identical value, so the delta is exactly zero.
+#define IMU_STALE_MS     5000UL
+#define IMU_STALE_DELTA  0.0005f
+
+#define BUZZER_ACTIVE_LOW  0
+
+#define PIN_LED_R   3     // module 1+, red die
+#define PIN_LED_G   5     // module 2+, green die
+#define PIN_LED_B   21    // bare blue LED via 68R  (D21 = A7, full GPIO)
+#define PIN_BUZZER  9
+#define PIN_BUTTON  2
+
+// ---- ring buffer --------------------------------------------------
+#define AXES    EI_CLASSIFIER_RAW_SAMPLES_PER_FRAME
+#define RING_N  EI_CLASSIFIER_RAW_SAMPLE_COUNT
+
+static float ring[RING_N][AXES];
+static uint16_t head = 0;
+static uint32_t written = 0;
+static float window[EI_CLASSIFIER_DSP_INPUT_FRAME_SIZE];
+
+// ---------------------------------------------------------- BLE
+BLEService svc("19B10000-E8F2-537E-4F6C-D104768A1214");
+BLEUnsignedCharCharacteristic alertChar(
+    "19B10001-E8F2-537E-4F6C-D104768A1214", BLERead | BLENotify);
+BLEStringCharacteristic statusChar(
+    "19B10002-E8F2-537E-4F6C-D104768A1214", BLERead | BLENotify, 32);
+
+// ---------------------------------------------------------- state
+enum Prop  : uint8_t { PR_IDLE, PR_DIP, PR_WAIT };
+enum Alert : uint8_t { A_IDLE, A_PENDING, A_ALARM };
+enum Cause : uint8_t { C_NONE, C_FALL, C_SEIZURE };
+
+Prop  prop  = PR_IDLE;
+Alert alert = A_IDLE;
+Cause cause = C_NONE;
+
+uint32_t dipStart = 0, inferAt = 0;
+uint32_t alertAt = 0, refractoryUntil = 0, lastSent = 0, lastLogged = 0;
+uint32_t nextSample = 0, nextPrint = 0, shakeRetryAt = 0;
+const uint16_t PERIOD_MS = 1000 / SAMPLE_HZ;
+
+float accMag = 1.0f, gyroMag = 0.0f, tiltDeg = 0.0f;
+float shakeRms = 0.0f, shakeFreq = 0.0f;
+uint8_t shakeRun = 0, strongRun = 0;
+float lastFallConf = 0, lastSeizConf = 0;
+bool modelFailed = false, forcedAlert = false;
+
+float dcMag = 1.0f, lpVal = 0.0f, sumSq = 0.0f;
+uint16_t winCount = 0, zc = 0;
+int8_t lastSign = 0;
+
+float gvx = 0, gvy = 0, gvz = 1;
+float refx = 0, refy = 0, refz = 1;
+bool refSet = false;
+
+float lastAccMag = -1.0f;
+uint32_t lastAccChange = 0;
+bool imuFault = false;
+
+// ---------------------------------------------------- buzzer patterns
+struct Beat { uint16_t ms; bool on; };
+
+const Beat PAT_SEIZURE[] = {
+  {110, true}, {110, false},
+  {110, true}, {110, false},
+  {110, true}, {110, false},
+  {420, true}, {800, false}
+};
+const Beat PAT_FALL[]  = { {150, true}, {130, false} };
+const Beat PAT_FAULT[] = { {60, true}, {140, false},
+                           {60, true}, {1400, false} };
+
+const uint8_t N_SEIZURE = sizeof(PAT_SEIZURE) / sizeof(Beat);
+const uint8_t N_FALL    = sizeof(PAT_FALL)    / sizeof(Beat);
+const uint8_t N_FAULT   = sizeof(PAT_FAULT)   / sizeof(Beat);
+
+uint8_t beatIdx = 0;
+uint32_t beatUntil = 0;
+
+// -------------------------------------------------------- watchdog
+// Cannot be stopped once started. If the loop stalls past WATCHDOG_MS
+// the chip resets and detection resumes. If you hit a reset loop,
+// double-tap RESET to reach the bootloader and upload from there.
+void watchdogStart(uint32_t ms) {
+  NRF_WDT->CONFIG = (WDT_CONFIG_HALT_Pause << WDT_CONFIG_HALT_Pos) |
+                    (WDT_CONFIG_SLEEP_Run  << WDT_CONFIG_SLEEP_Pos);
+  NRF_WDT->CRV   = (32768UL * ms / 1000UL) - 1;
+  NRF_WDT->RREN  = WDT_RREN_RR0_Msk;
+  NRF_WDT->TASKS_START = 1;
+}
+inline void watchdogFeed() { NRF_WDT->RR[0] = WDT_RR_RR_Reload; }
+
+// -------------------------------------------------------- utilities
+static inline float mag3(float x, float y, float z) {
+  return sqrtf(x * x + y * y + z * z);
+}
+
+static float angleBetween(float ax, float ay, float az,
+                          float bx, float by, float bz) {
+  float na = mag3(ax, ay, az), nb = mag3(bx, by, bz);
+  if (na < 1e-3f || nb < 1e-3f) return 0.0f;
+  float d = (ax * bx + ay * by + az * bz) / (na * nb);
+  if (d > 1.0f) d = 1.0f;
+  if (d < -1.0f) d = -1.0f;
+  return acosf(d) * 57.2957795f;
+}
+
+void buzzOn()  { digitalWrite(PIN_BUZZER, BUZZER_ACTIVE_LOW ? LOW : HIGH); }
+void buzzOff() { digitalWrite(PIN_BUZZER, BUZZER_ACTIVE_LOW ? HIGH : LOW); }
+bool pressed() { return digitalRead(PIN_BUTTON) == LOW; }
+
+// r and g are the two dies of the bi-colour module; both on gives
+// amber. b is the separate bare LED.
+void setLED(uint8_t r, uint8_t g, uint8_t b) {
+  analogWrite(PIN_LED_R, r);
+  analogWrite(PIN_LED_G, g);
+  analogWrite(PIN_LED_B, b);
+}
+
+void resetPattern() { beatIdx = 0; beatUntil = 0; }
+
+void playPattern(const Beat* pat, uint8_t n, uint32_t now) {
+  if ((int32_t)(now - beatUntil) >= 0) {
+    beatIdx = (beatIdx + 1) % n;
+    beatUntil = now + pat[beatIdx].ms;
+  }
+  pat[beatIdx].on ? buzzOn() : buzzOff();
+}
+
+const char* postureName() {
+  if (tiltDeg < TILT_TILTED_DEG)     return "UPRIGHT";
+  if (tiltDeg < TILT_HORIZONTAL_DEG) return "TILTED ";
+  return "HORIZ  ";
+}
+
+const char* stateName() {
+  if (imuFault)           return "FAULT";
+  if (alert == A_ALARM)   return "ALARM";
+  if (alert == A_PENDING) return "PENDING";
+  if (prop == PR_DIP)     return "DIP";
+  if (prop == PR_WAIT)    return "WAIT";
+  return "idle";
+}
+
+const char* causeName() {
+  if (cause == C_FALL)    return modelFailed ? " [FALL*]" : " [FALL]";
+  if (cause == C_SEIZURE) return forcedAlert ? " [SEIZURE*]" : " [SEIZURE]";
+  return "";
+}
+
+void clearShake() { shakeRun = 0; strongRun = 0; }
+
+void pushSample(float ax, float ay, float az,
+                float gx, float gy, float gz) {
+  ring[head][0] = ax; ring[head][1] = ay; ring[head][2] = az;
+  ring[head][3] = gx; ring[head][4] = gy; ring[head][5] = gz;
+  head = (head + 1) % RING_N;
+  written++;
+}
+
+// Copy the ring out in chronological order. `head` is the next write
+// slot, so it is also the OLDEST sample of the last RING_N.
+void linearise() {
+  uint16_t idx = head;
+  size_t o = 0;
+  for (uint16_t i = 0; i < RING_N; i++) {
+    for (uint8_t a = 0; a < AXES; a++) window[o++] = ring[idx][a];
+    idx = (idx + 1) % RING_N;
+  }
+}
+
+// Mirror the alert into the advertising packet, so a phone that is only
+// scanning sees it without holding a connection.
+void advertiseState(uint8_t code) {
+  uint8_t mfg[3] = { 0xFF, 0xFF, code };
+  BLE.stopAdvertise();
+  BLE.setManufacturerData(mfg, sizeof(mfg));
+  BLE.advertise();
+}
+
+// ---------------------------------------------------------- setup
+void setup() {
+  Serial.begin(115200);
+  pinMode(PIN_LED_R, OUTPUT);
+  pinMode(PIN_LED_G, OUTPUT);
+  pinMode(PIN_LED_B, OUTPUT);
+  pinMode(PIN_BUZZER, OUTPUT);
+  pinMode(PIN_BUTTON, INPUT_PULLUP);
+
+  buzzOff();
+  setLED(0, 0, 0);
+
+  if (!IMU.begin()) {
+    while (1) { setLED(0, 0, 200); delay(300); setLED(0, 0, 0); delay(300); }
+  }
+  if (!BLE.begin()) {
+    while (1) { setLED(200, 0, 200); delay(300); setLED(0, 0, 0); delay(300); }
+  }
+
+  BLE.setLocalName("FallBand");
+  BLE.setDeviceName("FallBand");
+  BLE.setAdvertisedService(svc);
+  svc.addCharacteristic(alertChar);
+  svc.addCharacteristic(statusChar);
+  BLE.addService(svc);
+  alertChar.writeValue(0);
+  statusChar.writeValue("OK");
+  BLE.advertise();
+
+  Serial.print("FallBand ready. Model: ");
+  Serial.print(EI_CLASSIFIER_LABEL_COUNT);
+  Serial.println(" classes.");
+  Serial.println("Hold upright for 2 s to set the posture reference.");
+  lastAccChange = millis();
+
+  // Self-test: red, green, amber, blue. If amber looks pure red, the
+  // green die is not connected. If blue never lights, check D21.
+  buzzOn();
+  setLED(255, 0, 0);   delay(180);
+  setLED(0, 255, 0);   delay(180);
+  setLED(255, 90, 0);  delay(180);
+  setLED(0, 0, 255);   delay(180);
+  buzzOff();
+  setLED(0, 0, 0);
+
+  watchdogStart(WATCHDOG_MS);
+}
+
+// ------------------------------------------------------- inference
+// One run fills BOTH confidences, so an impact that turns out to be
+// shaking still gets labelled correctly, and vice versa.
+bool classify(float &fallConf, float &seizConf) {
+  fallConf = 0; seizConf = 0;
+  linearise();
+
+  signal_t signal;
+  if (numpy::signal_from_buffer(window,
+        EI_CLASSIFIER_DSP_INPUT_FRAME_SIZE, &signal) != 0) return false;
+
+  ei_impulse_result_t result = {0};
+  if (run_classifier(&signal, &result, false) != EI_IMPULSE_OK) return false;
+
+  for (size_t i = 0; i < EI_CLASSIFIER_LABEL_COUNT; i++) {
+    const char* lab = result.classification[i].label;
+    float v = result.classification[i].value;
+    if (strcmp(lab, "fall") == 0)    fallConf = v;
+    if (strcmp(lab, "seizure") == 0) seizConf = v;
+  }
+  return true;
+}
+
+// ------------------------------------------------- shake proposer
+// 1 = normal candidate, 2 = strong enough to alert without the model.
+uint8_t updateShake(float m) {
+  dcMag += DC_ALPHA * (m - dcMag);      // high-pass: strip gravity
+  float hp = m - dcMag;
+  lpVal += LP_ALPHA * (hp - lpVal);     // low-pass: strip noise
+  float bp = lpVal;
+
+  sumSq += bp * bp;
+
+  int8_t sign = 0;
+  if (bp >  SHAKE_DEADBAND) sign =  1;
+  else if (bp < -SHAKE_DEADBAND) sign = -1;
+  if (sign != 0) {
+    if (lastSign != 0 && sign != lastSign) zc++;
+    lastSign = sign;
+  }
+
+  if (++winCount < SHAKE_WIN_SAMPLES) return 0;
+
+  shakeRms  = sqrtf(sumSq / SHAKE_WIN_SAMPLES);
+  // Crossings / 2 = cycles, scaled by window length. A plain divide by
+  // two only works when the window is exactly one second.
+  shakeFreq = (zc / 2.0f) * (1000.0f / SHAKE_WIN_MS);
+  sumSq = 0; winCount = 0; zc = 0; lastSign = 0;
+
+  bool inBand = shakeFreq >= SHAKE_FREQ_LO && shakeFreq <= SHAKE_FREQ_HI;
+  bool ok     = inBand && shakeRms > SHAKE_RMS_G;
+  bool strong = inBand && shakeRms > SHAKE_FORCE_RMS;
+
+  if (ok)     { if (shakeRun  < 255) shakeRun++;  }
+  else        { shakeRun  = (shakeRun  >= 2) ? shakeRun  - 2 : 0; }
+  if (strong) { if (strongRun < 255) strongRun++; }
+  else        { strongRun = (strongRun >= 2) ? strongRun - 2 : 0; }
+
+  // Both counters reset together, or they drift out of step and the
+  // strong path stops firing after the first trigger.
+#if SHAKE_FORCE_ON
+  if (strongRun >= SHAKE_FORCE_WINDOWS) { clearShake(); return 2; }
+#endif
+  if (shakeRun >= SHAKE_WINDOWS) { clearShake(); return 1; }
+  return 0;
+}
+
+// -------------------------------------------------- fall proposer
+void updateProposer(float a, uint32_t now) {
+  switch (prop) {
+    case PR_IDLE:
+      if (a < PROP_FREEFALL_G) { dipStart = now; prop = PR_DIP; }
+      break;
+    case PR_DIP:
+      if (a > PROP_IMPACT_G) { inferAt = now + POST_MS; prop = PR_WAIT; }
+      else if (now - dipStart > PROP_WINDOW_MS) prop = PR_IDLE;
+      break;
+    case PR_WAIT: break;
+  }
+}
+
+// ------------------------------------------------------ indicators
+void indicators(uint32_t now) {
+  // A dead IMU means no detection at all. Say so rather than sitting
+  // there looking healthy.
+  if (imuFault && alert == A_IDLE) {
+    bool on = (now % 1000UL) < 100;
+    setLED(on ? 255 : 0, 0, on ? 255 : 0);      // magenta
+    playPattern(PAT_FAULT, N_FAULT, now);
+    return;
+  }
+
+  switch (alert) {
+
+    case A_IDLE:
+      setLED(0, 0, 0);
+      buzzOff();
+      break;
+
+    case A_PENDING: {
+      bool on = (now % 500UL) < 150;
+      // With no phone connected the BLE alert reaches nobody, so the
+      // local alarm is all there is. Skip the grace period.
+      uint32_t delayMs = BLE.connected() ? BUZZER_DELAY_MS : 0;
+
+      if (cause == C_SEIZURE) {
+        setLED(0, 0, on ? 255 : 0);             // blue only
+        if (now - alertAt > delayMs) playPattern(PAT_SEIZURE, N_SEIZURE, now);
+        else buzzOff();
+      } else {
+        setLED(on ? 255 : 0, on ? 90 : 0, 0);   // amber, both dies
+        if (now - alertAt > delayMs) { on ? buzzOn() : buzzOff(); }
+        else buzzOff();
+      }
+      break;
+    }
+
+    case A_ALARM: {
+      if (cause == C_SEIZURE) {
+        bool on = (now % 400UL) < 200;
+        setLED(0, 0, on ? 255 : 30);            // blue only, slow pulse
+        playPattern(PAT_SEIZURE, N_SEIZURE, now);
+      } else {
+        bool on = (now % 300UL) < 150;
+        setLED(on ? 255 : 0, 0, 0);             // red die only
+        playPattern(PAT_FALL, N_FALL, now);
+      }
+      break;
+    }
+  }
+}
+
+void raise(Cause c, uint32_t now, bool forced = false) {
+  cause = c;
+  forcedAlert = forced;
+  alert = A_PENDING;
+  alertAt = now;
+  resetPattern();
+  uint8_t code = (c == C_FALL) ? 1 : 2;
+  // Notify immediately. Someone mid-seizure cannot press cancel, so
+  // waiting the full cancel window before telling anyone is wrong.
+  alertChar.writeValue(code);
+  statusChar.writeValue(c == C_FALL ? "PENDING: FALL" : "PENDING: SEIZURE");
+  advertiseState(code);
+  Serial.print(c == C_FALL ? ">>> FALL" : ">>> SEIZURE");
+  Serial.print(" detected  (BLE sent, phone ");
+  Serial.print(BLE.connected() ? "connected)" : "NOT connected)");
+  if (forced) Serial.print("  [threshold override]");
+  Serial.println(modelFailed ? "  [model fault]" : "");
+}
+
+void clearAlert(uint32_t now, const char* why) {
+  alert = A_IDLE; cause = C_NONE;
+  modelFailed = false; forcedAlert = false;
+  refractoryUntil = now + REFRACTORY_MS;
+  clearShake();
+  resetPattern();
+  buzzOff(); setLED(0, 0, 0);
+  alertChar.writeValue(0);
+  statusChar.writeValue("OK");
+  advertiseState(0);
+  Serial.println(why);
+}
+
+// ---------------------------------------------------------- loop
+void loop() {
+  watchdogFeed();
+  BLE.poll();
+
+  uint32_t now = millis();
+  if ((int32_t)(now - nextSample) < 0) { indicators(now); return; }
+  nextSample += PERIOD_MS;
+
+  if (!IMU.accelerationAvailable() || !IMU.gyroscopeAvailable()) {
+    indicators(now); return;
+  }
+
+  float ax, ay, az, gx, gy, gz;
+  IMU.readAcceleration(ax, ay, az);
+  IMU.readGyroscope(gx, gy, gz);
+  pushSample(ax, ay, az, gx, gy, gz);
+
+  accMag  = mag3(ax, ay, az);
+  gyroMag = mag3(gx, gy, gz);
+
+  // A frozen sensor still reports "available" and hands back a
+  // bit-identical value forever, so the delta is exactly zero. Only a
+  // changing value proves it is alive -- but the threshold has to sit
+  // BELOW the sensor's own noise, not above it.
+  if (fabsf(accMag - lastAccMag) > IMU_STALE_DELTA) {
+    lastAccMag = accMag;
+    lastAccChange = now;
+    if (imuFault) { imuFault = false; Serial.println("IMU recovered."); }
+  } else if (!imuFault && (now - lastAccChange) > IMU_STALE_MS) {
+    imuFault = true;
+    statusChar.writeValue("FAULT: IMU STALE");
+    advertiseState(9);
+    Serial.println("!!! IMU appears frozen - detection is DOWN");
+  }
+
+  gvx += DC_ALPHA * (ax - gvx);
+  gvy += DC_ALPHA * (ay - gvy);
+  gvz += DC_ALPHA * (az - gvz);
+
+  if (!refSet && now > 2000) {
+    refx = gvx; refy = gvy; refz = gvz;
+    refSet = true;
+    Serial.println("Upright reference captured.");
+  }
+  if (refSet) tiltDeg = angleBetween(gvx, gvy, gvz, refx, refy, refz);
+
+  bool ready = (written >= RING_N) && (alert == A_IDLE) &&
+               (now > refractoryUntil);
+
+  // ---- fall path ----
+  updateProposer(accMag, now);
+  if (prop == PR_WAIT && (int32_t)(now - inferAt) >= 0) {
+    prop = PR_IDLE;
+    if (ready) {
+      float fc, sc;
+      if (!classify(fc, sc)) {
+        // Falling silent would be the worst outcome: the proposer
+        // already saw free fall then impact, which is a fall on the
+        // threshold rule alone. Alert.
+        modelFailed = true;
+        Serial.println("!!! model error - falling back to threshold");
+        raise(C_FALL, now);
+      } else {
+        modelFailed = false;
+        lastFallConf = fc; lastSeizConf = sc;
+        Serial.print("impact candidate -> fall ");
+        Serial.print(fc, 2); Serial.print("  seizure ");
+        Serial.println(sc, 2);
+        if (fc >= CONF_FALL)         raise(C_FALL, now);
+        else if (sc >= CONF_SEIZURE) raise(C_SEIZURE, now);
+        else Serial.println("  rejected by model");
+      }
+    }
+    // Inference stalls the loop for tens of ms; resync so we do not
+    // then fire a burst of catch-up samples with wrong timestamps.
+    nextSample = millis() + PERIOD_MS;
+  }
+
+  // ---- seizure path ----
+  uint8_t shakeEvt = updateShake(accMag);
+  if (shakeEvt) {
+    if (!ready) {
+      // Silence here is what made this look like a dead sensor.
+      Serial.print("shake seen but suppressed: ");
+      if (alert != A_IDLE) {
+        Serial.println("alert already active");
+      } else if (now <= refractoryUntil) {
+        Serial.print("refractory, ");
+        Serial.print((refractoryUntil - now) / 1000);
+        Serial.println(" s left");
+      } else {
+        Serial.println("buffer still filling");
+      }
+    } else if ((int32_t)(now - shakeRetryAt) < 0) {
+      Serial.println("shake seen but suppressed: retry timer");
+    } else {
+      shakeRetryAt = now + SHAKE_RETRY_MS;
+
+      if (shakeEvt == 2) {
+        // Strong sustained shaking. Alert regardless of the model: the
+        // seizure class came from only 30 recordings, so it will miss
+        // things, and a missed seizure costs more than a false alarm.
+        Serial.print("STRONG shake  rms=");
+        Serial.print(shakeRms, 2); Serial.print("  ");
+        Serial.print(shakeFreq, 1); Serial.println(" Hz");
+        raise(C_SEIZURE, now, true);
+      } else {
+        float fc, sc;
+        if (classify(fc, sc)) {
+          lastFallConf = fc; lastSeizConf = sc;
+          Serial.print("shake candidate  -> seizure ");
+          Serial.print(sc, 2); Serial.print("  fall ");
+          Serial.print(fc, 2);
+          Serial.print("   (rms "); Serial.print(shakeRms, 2);
+          Serial.print(", "); Serial.print(shakeFreq, 1);
+          Serial.println(" Hz)");
+          if (sc >= CONF_SEIZURE)   raise(C_SEIZURE, now);
+          else if (fc >= CONF_FALL) raise(C_FALL, now);
+          else Serial.println("  rejected by model");
+        } else {
+          Serial.println("  model error");
+        }
+      }
+      nextSample = millis() + PERIOD_MS;
+    }
+  }
+
+  // ---- button ----
+  if (pressed()) {
+    if (alert == A_PENDING || (alert == A_ALARM && now - alertAt > 1000)) {
+      clearAlert(now, "<<< dismissed");
+    }
+  }
+
+  // ---- escalation ----
+  if (alert == A_PENDING && (now - alertAt) >= CANCEL_MS) {
+    alert = A_ALARM;
+    alertAt = now; lastSent = now; lastLogged = now;
+    resetPattern();
+    statusChar.writeValue(cause == C_FALL ? "ALERT: FALL" : "ALERT: SEIZURE");
+    Serial.println(">>> ALARM  (not dismissed)");
+  }
+
+  if (alert == A_ALARM && (now - lastSent) >= 2000UL) {
+    alertChar.writeValue(cause == C_FALL ? 1 : 2);
+    lastSent = now;
+    if (now - lastLogged >= ALARM_LOG_MS) {
+      Serial.println(">>> still alarming, press button to dismiss");
+      lastLogged = now;
+    }
+  }
+
+  // A missed button press must not disable detection permanently.
+  if (alert == A_ALARM && (now - alertAt) >= ALARM_TIMEOUT_MS) {
+    clearAlert(now, "<<< alarm timed out, auto-cleared");
+  }
+
+  indicators(now);
+
+  // ---- telemetry ----
+  if ((int32_t)(now - nextPrint) >= 0) {
+    nextPrint = now + PRINT_MS;
+    Serial.print("a="); Serial.print(accMag, 2);
+    Serial.print("g w=");  Serial.print(gyroMag, 0);
+    Serial.print("dps tilt="); Serial.print(tiltDeg, 0);
+    Serial.print(" "); Serial.print(postureName());
+    Serial.print(" shake="); Serial.print(shakeRms, 2);
+    Serial.print("/"); Serial.print(shakeFreq, 1);
+    Serial.print("Hz n="); Serial.print(shakeRun);
+    Serial.print("/s="); Serial.print(strongRun);
+    Serial.print(" conf f="); Serial.print(lastFallConf, 2);
+    Serial.print(" sz="); Serial.print(lastSeizConf, 2);
+    Serial.print(" "); Serial.print(BLE.connected() ? "BLE " : "--- ");
+    Serial.print(stateName());
+    Serial.print(causeName());
+    if (now < refractoryUntil) {
+      Serial.print(" Wait Please ");
+      Serial.print((refractoryUntil - now) / 1000);
+      Serial.print("s");
+    }
+    Serial.println();
+  }
+}
