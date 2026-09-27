@@ -7,3 +7,11 @@ This device is a simple feedback device that uses Arduino Nano 33 BLE. It is a s
 3. 3D printer for casing
 4. Push button, buzzer, LED
 5. C++ code
+# Results
+1.  Seizures are detected well. Waits for a certain pattern and time before beeping.
+2.  Fall is also detected based on a simple logic. There is free fall and then impact.
+3.  The gravity acceleration changes. Thresholds are around 0.8g for free fall and around 1.7g for impact.
+4.  Time threshold: beeping for about 3 seconds before sending BLE.
+5.  Frequency threshold is about 2-30  Hz for seizure detection.
+6.  Simple and cheap alternative for smart devices and very accessible.
+7.  Can be improved well. Best use case for severe epilepsy and seizures and can alert people to avoid physical injuries as a result of seizures and fall such as tongue biting, twisted body, sharp surface injuries etc. 
